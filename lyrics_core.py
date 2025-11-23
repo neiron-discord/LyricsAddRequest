@@ -55,24 +55,28 @@ def github_get_lyrics(repo_name: str) -> Optional[str]:
 
 
 def _serialize_lyrics(plain: Optional[str], cues: Optional[List[Dict]]) -> str:
-    """
-    (plain or 時刻付き cues) → 保存用の文字列に変換。
-    """
     if plain:
         return (plain or "").strip()
     if not cues:
         return ""
-    out: List[str] = []
-    prev_end = 0.0
+
+    out, prev_end = [], 0.0
     for e in cues:
         if e["start"] - prev_end >= 4.0 and out:
             out.append("")
+
         mm, ss = divmod(int(e["start"]), 60)
         cs = int(round((e["start"] - int(e["start"])) * 100))
         stamp = f"[{mm:02d}:{ss:02d}.{cs:02d}]"
-        out.append(f"{stamp} {e['text'].replace('\n', ' ').strip()}")
+
+        # ← バックスラッシュを含む処理は f-string の外でやる
+        text = (e.get("text") or "").replace("\n", " ").strip()
+        out.append(f"{stamp} {text}")
+
         prev_end = e["end"]
+
     return "\n".join(out)
+
 
 
 def github_save_lyrics(
