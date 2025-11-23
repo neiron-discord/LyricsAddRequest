@@ -2,60 +2,56 @@
 # -*- coding: utf-8 -*-
 
 """
-GitHub Actions: Issue body → 歌詞自動取得 → コメント返信
-2025-11-23
-"""
+Issue 本文からアーティスト/曲名/動画IDを取り出し、
+外部歌詞APIから plainLyrics / syncedLyrics を取得して
+Issue に結果コメントを追加するだけのスクリプト。
 
-from __future__ import annotations
+- リポジトリ作成や README 作成はやらない
+- 歌詞サービス名はコメントに書かない
+- ローカルPC用スクリプトが機械的に拾えるように
+  JSON ペイロードもコメントに埋め込む
+"""
 
 import json
 import os
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import requests
-from github import Github
+from github import Github, Auth
 
-# ---------- GitHub Event ----------
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
+
+# ---------- GitHub イベント読み込み ----------
 
 def load_github_event() -> Dict[str, Any]:
-    """
-    Actions から渡される GITHUB_EVENT_PATH から event JSON を読み込む。
-    """
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
-    if not event_path:
+    path = os.environ.get("GITHUB_EVENT_PATH")
+    if not path:
         raise RuntimeError("環境変数 GITHUB_EVENT_PATH が設定されていません。")
-
-    with open(event_path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-# ---------- Issue body parsing ----------
+# ---------- Issue 本文パース（パターンA） ----------
 
-YOUTUBE_ID_PATTERNS = [
-    # 「動画 ID: XXXXXXXX」
-    re.compile(r"^動画\s*ID\s*[:：]\s*([0-9A-Za-z_-]{8,})\s*$", re.MULTILINE),
-    # https://www.youtube.com/watch?v=XXXXXXXX
-    re.compile(
-        r"(?:https?://)?(?:www\.)?youtube\.com/watch\?[^ \n\r\t]*v=([0-9A-Za-z_-]{8,})"
-    ),
-    # https://youtu.be/XXXXXXXX
-    re.compile(r"(?:https?://)?(?:www\.)?youtu\.be/([0-9A-Za-z_-]{8,})"),
+YOUTUBE_PATTERNS = [
+    # https://youtu.be/<id>
+    r"(?:https?://)?(?:www\.)?youtu\.be/([0-9A-Za-z_-]{8,})",
+    # https://www.youtube.com/watch?v=<id>
+    r"(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([0-9A-Za-z_-]{8,})",
+    # https://www.youtube.com/shorts/<id>
+    r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([0-9A-Za-z_-]{8,})",
 ]
 
 
 def extract_video_id_from_text(text: str) -> Optional[str]:
-    """
-    本文から YouTube の video_id をゆるく抽出する。
-    """
-    if not text:
-        return None
-    for pat in YOUTUBE_ID_PATTERNS:
-        m = pat.search(text)
+    for pat in YOUTUBE_PATTERNS:
+        m = re.search(pat, text)
         if m:
-            vid = (m.group(1) or "").strip()
+            vid = m.group(1).strip()
             if vid:
                 return vid
     return None
@@ -63,79 +59,63 @@ def extract_video_id_from_text(text: str) -> Optional[str]:
 
 def parse_issue_body(body: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    パターンA専用パーサー
+    パターンA:
+      1行目: "アーティスト - タイトル"
+      2行目以降: 任意。YouTubeリンクがあれば動画IDを取る。
 
-    フォーマット例:
-        1行目: "アーティスト - タイトル"
-        2行目以降: 任意（YouTube URL やメモなど）
+    戻り値: (artist, title, video_id)
     """
     artist: Optional[str] = None
     title: Optional[str] = None
+    video_id: Optional[str] = None
 
-    # 行に分割して前後の空白を落とす
     lines = [line.strip() for line in (body or "").splitlines()]
 
-    # ---- 1. 1 行目（または最初に見つかった行）から「アーティスト - タイトル」を取得 ----
+    # 1行目から「アーティスト - タイトル」を取得
     for line in lines:
         if not line:
             continue
         if " - " in line:
             left, right = line.split(" - ", 1)
-            left, right = left.strip(), right.strip()
-            if left or right:
-                artist = left or None
-                title = right or None
-                break
+            artist = (left or "").strip() or None
+            title = (right or "").strip() or None
+            break
 
-    # ---- 2. 本文全体から YouTube の video_id を取得 ----
+    # 本文全体から YouTube 動画IDを取得
     video_id = extract_video_id_from_text(body or "")
 
     return artist, title, video_id
 
 
-# ---------- Lyrics API (LrcLib 互換) ----------
+# ---------- 歌詞 API (名前は出さない) ----------
 
-LRC_LIB_BASE = "https://lrclib.net"
+LRC_LIB_BASE = "https://lrclib.net"   # コード内だけで使用。コメントには書かない。
 
 
-def _nf(s: str) -> str:
-    """
-    簡易正規化（NFKC + 小文字 + 連続空白の圧縮）。
-    """
+def _nf_lrc(s: str) -> str:
     import unicodedata as u
-
     t = u.normalize("NFKC", s or "")
-    t = re.sub(r"\s+", " ", t)
-    return t.strip().lower()
+    return re.sub(r"\s+", " ", t).strip().lower()
 
 
-@dataclass
-class LyricsRecord:
-    id: int
-    track_name: str
-    artist_name: str
-    album_name: Optional[str]
-    duration: Optional[float]
-    instrumental: bool
-    plain_lyrics: Optional[str]
-    synced_lyrics: Optional[str]
-
-
-def lrclib_search(
-    track_name: Optional[str] = None,
-    artist_name: Optional[str] = None,
-) -> Optional[LyricsRecord]:
+def search_lyrics_by_artist_title(
+    artist: Optional[str],
+    title: Optional[str],
+) -> Optional[Dict[str, Any]]:
     """
-    歌詞 API /api/search を叩いて、最もそれっぽい 1 件を返す。
-    （サービス名はコメントには出さない）
+    外部歌詞API /api/search を叩いて最も良さそうな1件を返す。
+    コメントにサービス名は出さない。
     """
+    if not artist and not title:
+        return None
+
     params: Dict[str, str] = {}
-    if track_name:
-        params["track_name"] = track_name
-    if artist_name:
-        params["artist_name"] = artist_name
+    if title:
+        params["track_name"] = title
+    if artist:
+        params["artist_name"] = artist
 
-    # どちらも無い場合は検索できない
+    # どちらかは必須
     if not params:
         return None
 
@@ -144,156 +124,122 @@ def lrclib_search(
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"[lyrics-api] search error: {e}")
+        print(f"[lyrics] search error: {e}")
         return None
 
     if not isinstance(data, list) or not data:
         return None
 
-    # track_name / artist_name が両方ある場合は簡易スコアリング
-    try:
-        from rapidfuzz import fuzz  # type: ignore
-    except Exception:
-        fuzz = None  # type: ignore
-
+    # track_name / artist_name がある場合は簡易スコア
     def score(rec: Dict[str, Any]) -> int:
-        if not fuzz:
-            # fuzzy が無ければ単純一致ボーナスだけ
-            s = 0
-            if track_name and rec.get("trackName"):
-                s += 100 if _nf(track_name) == _nf(rec["trackName"]) else 0
-            if artist_name and rec.get("artistName"):
-                s += 100 if _nf(artist_name) == _nf(rec["artistName"]) else 0
-            return s
-
         s = 0
-        if track_name and rec.get("trackName"):
-            s += fuzz.ratio(_nf(track_name), _nf(rec["trackName"]))
-        if artist_name and rec.get("artistName"):
-            s += fuzz.ratio(_nf(artist_name), _nf(rec["artistName"]))
+        if title and rec.get("trackName"):
+            s += 2 * (100 - abs(len(_nf_lrc(title)) - len(_nf_lrc(rec["trackName"]))))
+        if artist and rec.get("artistName"):
+            s += 2 * (100 - abs(len(_nf_lrc(artist)) - len(_nf_lrc(rec["artistName"]))))
         return s
 
-    best = max(data, key=score)
+    if artist or title:
+        best = max(data, key=score)
+        return best
 
-    try:
-        return LyricsRecord(
-            id=int(best.get("id")),
-            track_name=str(best.get("trackName") or best.get("name") or ""),
-            artist_name=str(best.get("artistName") or ""),
-            album_name=str(best["albumName"]) if best.get("albumName") else None,
-            duration=float(best["duration"]) if best.get("duration") is not None else None,
-            instrumental=bool(best.get("instrumental", False)),
-            plain_lyrics=(best.get("plainLyrics") or None),
-            synced_lyrics=(best.get("syncedLyrics") or None),
-        )
-    except Exception as e:
-        print(f"[lyrics-api] parse record error: {e}")
-        return None
+    return data[0]
 
 
-# ---------- Build comment body ----------
+# ---------- コメント生成 ----------
+
+JSON_START = "<!-- LYRICS_API_JSON_START -->"
+JSON_END = "<!-- LYRICS_API_JSON_END -->"
 
 
 def build_comment_body(
     artist: Optional[str],
     title: Optional[str],
     video_id: Optional[str],
-    rec: Optional[LyricsRecord],
+    rec: Optional[Dict[str, Any]],
 ) -> str:
-    lines: List[str] = []
+    lines: list[str] = []
 
     lines.append("自動歌詞登録の結果をお知らせします 🤖\n")
 
-    # ---- 解析結果 ----
+    # 解析結果
     lines.append("### 解析結果")
     lines.append(f"- アーティスト: **{artist}**" if artist else "- アーティスト: (未入力)")
     lines.append(f"- 楽曲名: **{title}**" if title else "- 楽曲名: (未入力)")
     if video_id:
         lines.append(f"- 動画 ID: `{video_id}`")
+    else:
+        lines.append("- 動画 ID: (未指定)")
 
-    # ---- 歌詞登録結果 ----
+    # 歌詞結果
     lines.append("\n### 歌詞登録結果")
 
     if rec is None:
-        lines.append("- ステータス: 歌詞を自動取得できませんでした。")
-        if artist or title:
-            used: List[str] = []
-            if artist:
-                used.append(f"artist='{artist}'")
-            if title:
-                used.append(f"title='{title}'")
-            lines.append("- 使用情報: " + ", ".join(used))
-        else:
-            lines.append("- 使用情報: (なし / 解析失敗)")
+        lines.append("- ステータス: 歌詞の取得に失敗しました")
+        lines.append("- 取得元: 外部歌詞データベース（取得エラー）")
     else:
-        has_plain = bool(rec.plain_lyrics)
-        has_synced = bool(rec.synced_lyrics)
+        plain = (rec.get("plainLyrics") or "").strip()
+        synced = (rec.get("syncedLyrics") or "").strip()
 
-        if has_synced:
+        if synced:
             status = "Auto/同期あり"
-        elif has_plain:
+        elif plain:
             status = "Auto/同期なし"
         else:
-            status = "歌詞情報なし"
+            status = "歌詞の登録なし"
 
         lines.append(f"- ステータス: {status}")
-        # サービス名は出さず、使ったメタだけ表示
-        used_parts: List[str] = []
-        if rec.artist_name:
-            used_parts.append(f"artist='{rec.artist_name}'")
-        if rec.track_name:
-            used_parts.append(f"track='{rec.track_name}'")
-        lines.append("- 検索に使用した情報: " + (", ".join(used_parts) or "(不明)"))
+        lines.append("- 取得元: 外部歌詞データベース")
+        tn = (rec.get("trackName") or rec.get("name") or "").strip()
+        an = (rec.get("artistName") or "").strip()
+        detail = []
+        if tn:
+            detail.append(f"track='{tn}'")
+        if an:
+            detail.append(f"artist='{an}'")
+        if detail:
+            lines.append(f"- 取得詳細: {', '.join(detail)}")
 
-        # 追加のメタ情報
-        extra_meta: List[str] = []
-        if rec.album_name:
-            extra_meta.append(f"album='{rec.album_name}'")
-        if rec.duration:
-            extra_meta.append(f"duration={rec.duration:.1f}s")
-        if rec.instrumental:
-            extra_meta.append("instrumental=true")
-        if extra_meta:
-            lines.append("- 付加情報: " + ", ".join(extra_meta))
-
-        # ---- 歌詞データ本体（折りたたみ） ----
-        if has_plain:
-            lines.append("\n<details><summary>テキスト歌詞（plainLyrics）を表示</summary>\n")
-            lines.append("```text")
-            lines.append(rec.plain_lyrics or "")
-            lines.append("```")
-            lines.append("</details>")
-
-        if has_synced:
-            lines.append("\n<details><summary>同期付き歌詞（syncedLyrics）を表示</summary>\n")
+        # 人間向けに歌詞本体も（長くなる場合あり）
+        if synced:
+            lines.append("\n#### syncedLyrics（タイミング付き）")
             lines.append("```lrc")
-            lines.append(rec.synced_lyrics or "")
+            lines.append(synced)
             lines.append("```")
-            lines.append("</details>")
+
+        if plain:
+            lines.append("\n#### plainLyrics（テキストのみ）")
+            lines.append("```text")
+            lines.append(plain)
+            lines.append("```")
+
+    # ローカルPC用：機械が読み取る JSON ペイロード
+    payload: Dict[str, Any] = {
+        "videoId": video_id,
+        "artist": artist,
+        "title": title,
+        "sourceRecord": rec,  # None でもそのまま
+    }
 
     lines.append("\n---")
-    lines.append(
-        "※ このコメントは GitHub Actions の自動処理で追加されています。"
-        " / フォーマット不備などでうまく登録できない場合があります。"
-    )
+    lines.append("以下はローカルスクリプト用のペイロードです（編集しないでください）。")
+    lines.append(JSON_START)
+    lines.append("```json")
+    lines.append(json.dumps(payload, ensure_ascii=False, indent=2))
+    lines.append("```")
+    lines.append(JSON_END)
+
+    lines.append("\n※ このコメントは GitHub Actions の自動処理で追加されています。")
 
     return "\n".join(lines)
 
 
-# ---------- GitHub helpers ----------
-
-
-def comment_to_issue(
-    repo,
-    issue_number: int,
-    body: str,
-) -> None:
+def comment_to_issue(repo, issue_number: int, body: str) -> None:
     issue = repo.get_issue(number=issue_number)
     issue.create_comment(body)
 
 
-# ---------- main ----------
-
+# ---------- メイン ----------
 
 def main() -> None:
     token = os.environ.get("GITHUB_TOKEN")
@@ -304,15 +250,13 @@ def main() -> None:
     if not repo_name:
         raise RuntimeError("環境変数 GITHUB_REPOSITORY が設定されていません。")
 
-    gh = Github(token)
-    # /user を触らず、直接リポジトリだけ取るので 403 を回避できる
+    gh = Github(auth=Auth.Token(token))
     repo = gh.get_repo(repo_name)
 
     event = load_github_event()
     action = event.get("action")
     issue_data = event.get("issue")
 
-    # issue イベントでなければスキップ
     if not issue_data:
         print("issue イベントではないため何もしません。")
         return
@@ -322,30 +266,23 @@ def main() -> None:
 
     print(f"action={action}, issue_number={issue_number}")
 
-    # opened / edited の時だけ処理する
     if action not in {"opened", "edited"}:
         print("opened/edited 以外のアクションなのでスキップします。")
         return
 
-    # Issue 本文を解析
     artist, title, video_id = parse_issue_body(issue_body)
     print(f"parsed: artist={artist}, title={title}, video_id={video_id}")
 
-    # 歌詞検索（動画 ID は不要。タイトル/アーティストだけで探す）
-    rec = lrclib_search(track_name=title, artist_name=artist)
+    # 歌詞検索
+    rec = search_lyrics_by_artist_title(artist, title)
     if rec:
-        print(
-            "lyrics hit: "
-            f"id={rec.id}, track={rec.track_name!r}, artist={rec.artist_name!r}"
-        )
+        print("[lyrics] record found:", rec.get("id"), rec.get("trackName"), rec.get("artistName"))
     else:
-        print("lyrics not found.")
+        print("[lyrics] no record found")
 
-    # 結果をコメントとして Issue に投稿
     comment_body = build_comment_body(artist, title, video_id, rec)
     comment_to_issue(repo, issue_number, comment_body)
-
-    print("処理が完了しました。")
+    print("comment posted.")
 
 
 if __name__ == "__main__":
