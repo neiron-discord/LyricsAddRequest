@@ -11,7 +11,6 @@ from github import Github
 
 # lyrics_core はこちらで作ったものを使う想定
 from lyrics_core import (
-    search_lyrics_candidates,
     fetch_lyrics_page,
     choose_best_lyrics,
     build_markdown_comment,
