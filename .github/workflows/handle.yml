@@ -1,0 +1,49 @@
+name: handle
+
+on:
+  issues:
+    types: [opened, edited, reopened, labeled]
+
+jobs:
+  handle:
+    runs-on: ubuntu-latest
+
+    env:
+      # GitHub のトークン（PAT を使うなら secrets.GH_PAT にするなど）
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # マルチラインの Netscape cookie を入れたシークレット
+      YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install yt-dlp PyGithub requests beautifulsoup4 rapidfuzz pillow
+
+      - name: Write YouTube cookies file
+        run: |
+          # マルチラインのシークレットをそのままファイルに書き出す
+          printf '%s\n' "$YOUTUBE_COOKIES" > youtube_cookies.txt
+        # 必要ならパーミッション
+        # shell: bash
+
+      - name: Handle issue
+        env:
+          # cookie ファイルのパスを Python に教える
+          YOUTUBE_COOKIES_FILE: youtube_cookies.txt
+
+          # あとはお好みで。既に使っていればそのままで OK
+          GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          python scripts/handle_issue.py
