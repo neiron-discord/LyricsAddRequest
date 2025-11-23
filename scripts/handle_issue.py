@@ -248,17 +248,21 @@ def _serialize_lyrics(plain: Optional[str], cues: Optional[List[Dict]]) -> str:
         return (plain or "").strip()
     if not cues:
         return ""
-    out: List[str] = []
-    prev_end = 0.0
+    out, prev_end = [], 0.0
     for e in cues:
         if e["start"] - prev_end >= 4.0 and out:
             out.append("")
         mm, ss = divmod(int(e["start"]), 60)
         cs = int(round((e["start"] - int(e["start"])) * 100))
         stamp = f"[{mm:02d}:{ss:02d}.{cs:02d}]"
-        out.append(f"{stamp} {e['text'].replace('\\n',' ').strip()}")
+
+        # ★ ここを分離する
+        text = e["text"].replace("\n", " ").strip()
+        out.append(f"{stamp} {text}")
+
         prev_end = e["end"]
     return "\n".join(out)
+
 
 
 def github_save_lyrics(
