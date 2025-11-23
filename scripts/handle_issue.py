@@ -2,7 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-2025/11/23
+GitHub Issues から「歌詞追加リクエスト」を受け取り、
+アーティスト名・楽曲名・YouTube 動画IDをパースして
+必要に応じて YouTube 検索を行い、その結果を Issue にコメントするスクリプト。
+
+2025/11/23 パターンA専用:
+  1行目: "アーティスト - タイトル"
+  本文どこかに YouTube URL があれば video_id を抽出
 """
 
 import json
@@ -17,7 +23,7 @@ from yt_dlp.utils import DownloadError
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-WORKDIR = ROOT_DIR  # 一応ワークディレクトリ
+WORKDIR = ROOT_DIR
 
 # デフォルトの cookies.txt のパス（ワークフローステップで書き出した想定）
 DEFAULT_COOKIES_PATH = ROOT_DIR / "youtube_cookies.txt"
@@ -38,37 +44,44 @@ def load_github_event() -> Dict[str, Any]:
         return json.load(f)
 
 
-# ---------- Issue 本文パース ----------
+# ---------- 文字列 → YouTube video_id 抽出 ----------
 
 
-ISSUE_ARTIST_PATTERNS = [
-    r"^アーティスト(?:名)?\s*[:：]\s*(.+)$",
-    r"^Artist\s*[:：]\s*(.+)$",
-]
-ISSUE_TITLE_PATTERNS = [
-    r"^楽曲名\s*[:：]\s*(.+)$",
-    r"^タイトル\s*[:：]\s*(.+)$",
-    r"^Title\s*[:：]\s*(.+)$",
-]
-ISSUE_VIDEO_ID_PATTERNS = [
-    r"^動画\s*ID\s*[:：]\s*([0-9A-Za-z_-]{8,})$",
-    r"(?:youtube\.com/watch\?v=|youtu\.be/)([0-9A-Za-z_-]{8,})",
+YOUTUBE_URL_PATTERNS = [
+    # https://www.youtube.com/watch?v=XXXXXXXXXXX
+    r"(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([0-9A-Za-z_-]{8,})",
+    # https://youtu.be/XXXXXXXXXXX
+    r"(?:https?://)?(?:www\.)?youtu\.be/([0-9A-Za-z_-]{8,})",
 ]
 
 
-def _search_one(patterns, text: str) -> Optional[str]:
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.MULTILINE)
-        if m:
-            value = m.group(1).strip()
-            if value:
-                return value
+def extract_video_id_from_text(text: str) -> Optional[str]:
+    """
+    テキスト全体から YouTube の動画IDを1件だけ抜き出す。
+
+    - https://www.youtube.com/watch?v=...
+    - https://youtu.be/...
+
+    の両方に対応。
+    """
+    for pat in YOUTUBE_URL_PATTERNS:
+        m = re.search(pat, text)
+        if not m:
+            continue
+        vid = m.group(1)
+        # "&t=123s" などがくっついていた場合に備えて "&" で区切る
+        vid = vid.split("&", 1)[0]
+        if vid:
+            return vid
     return None
 
 
-def parse_issue_body(body: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+# ---------- Issue 本文パース（パターンA専用） ----------
+
+
+def parse_issue_body(body: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    パターンA専用パーサー
+    パターンA専用パーサー。
 
     フォーマット:
         1行目: "アーティスト - タイトル"
@@ -98,7 +111,6 @@ def parse_issue_body(body: str) -> tuple[Optional[str], Optional[str], Optional[
     video_id = extract_video_id_from_text(body)
 
     return artist, title, video_id
-
 
 
 # ---------- YouTube 検索 ----------
@@ -253,7 +265,7 @@ def main() -> None:
         print("opened/edited 以外のアクションなのでスキップします。")
         return
 
-    # Issue 本文を解析
+    # Issue 本文を解析（パターンA）
     artist, title, video_id = parse_issue_body(issue_body)
     print(f"parsed: artist={artist}, title={title}, video_id={video_id}")
 
