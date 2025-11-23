@@ -66,19 +66,39 @@ def _search_one(patterns, text: str) -> Optional[str]:
     return None
 
 
-def parse_issue_body(body: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def parse_issue_body(body: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Issue テンプレから
-    - アーティスト
-    - 楽曲名
-    - 動画 ID（または URL から抽出）
-    を抜き出す。
+    パターンA専用パーサー
+
+    フォーマット:
+        1行目: "アーティスト - タイトル"
+        2行目以降: 任意。YouTube の URL が含まれていれば video_id を取得する。
+
+    戻り値: (artist, title, video_id)
     """
-    artist = _search_one(ISSUE_ARTIST_PATTERNS, body)
-    title = _search_one(ISSUE_TITLE_PATTERNS, body)
-    video_id = _search_one(ISSUE_VIDEO_ID_PATTERNS, body)
+    artist: Optional[str] = None
+    title: Optional[str] = None
+    video_id: Optional[str] = None
+
+    # 行に分割して前後の空白を落とす
+    lines = [line.strip() for line in body.splitlines()]
+
+    # ---- 1. 1行目から「アーティスト - タイトル」を取得 ----
+    for line in lines:
+        if not line:
+            continue
+        # " - " で分割（最初に見つかった "-" だけ使う）
+        if " - " in line:
+            left, right = line.split(" - ", 1)
+            artist = left.strip() or None
+            title = right.strip() or None
+            break
+
+    # ---- 2. 本文全体から YouTube の video_id を取得 ----
+    video_id = extract_video_id_from_text(body)
 
     return artist, title, video_id
+
 
 
 # ---------- YouTube 検索 ----------
