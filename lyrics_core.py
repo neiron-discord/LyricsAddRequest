@@ -1,10 +1,10 @@
 # lyrics_core.py
-# GitHub 歌詞リポジトリ + LrcLib + PetitLyrics 周りをまとめた共通モジュール
+# GitHub 歌詞リポジトリ + LrcLib + PetitLyrics + YouTube メタまわりの共通モジュール
 
 from __future__ import annotations
+
 import os
 import re
-import json
 import base64
 import itertools
 import unicodedata
@@ -16,34 +16,35 @@ from rapidfuzz import fuzz
 from github import Github, GithubException
 
 # ─────────────────────────────────────────
-# GitHub クライアント
+# GitHub クライアント (歌詞保存用)
 # ─────────────────────────────────────────
 
-_token = os.getenv("LYRICS_GH_TOKEN") or os.getenv("GITHUB_TOKEN")
-if not _token:
+_TOKEN = os.getenv("LYRICS_GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+if not _TOKEN:
     raise RuntimeError("lyrics_core: LYRICS_GH_TOKEN か GITHUB_TOKEN を環境変数で渡してください")
 
-_gh = Github(_token)
-_gh_user = _gh.get_user()
+_GH = Github(_TOKEN)
+_GH_USER = _GH.get_user()
 
 # ─────────────────────────────────────────
 # GitHub 歌詞 helpers
 # ─────────────────────────────────────────
 
-FENCE_RE = re.compile(r'^```.*?$|^```$', re.M)
+FENCE_RE = re.compile(r"^```.*?$|^```$", re.M)
 
 
 def _unfence(text: str) -> str:
+    """``` で囲まれている場合は外す。"""
     return re.sub(FENCE_RE, "", text).strip()
 
 
 def github_get_lyrics(repo_name: str) -> Optional[str]:
     """
-    <owner>/<repo_name> ではなく、PAT のユーザー直下の <repo_name> を見る前提。
-    README.md からコードフェンスを外したテキストを返す。
+    PAT のユーザー直下にある <repo_name> リポジトリの README.md から歌詞テキストを取得する。
+    見つからない場合は None。
     """
     try:
-        repo = _gh_user.get_repo(repo_name)
+        repo = _GH_USER.get_repo(repo_name)
         readme = repo.get_readme()
         raw = readme.decoded_content.decode("utf-8", "ignore")
         return _unfence(raw) or None
@@ -55,7 +56,7 @@ def github_get_lyrics(repo_name: str) -> Optional[str]:
 
 def _serialize_lyrics(plain: Optional[str], cues: Optional[List[Dict]]) -> str:
     """
-    (plain 歌詞 / 同期歌詞 cues) → 保存用テキスト
+    (plain or 時刻付き cues) → 保存用の文字列に変換。
     """
     if plain:
         return (plain or "").strip()
@@ -85,11 +86,12 @@ def github_save_lyrics(
     music_meta: Optional[Dict[str, Optional[str]]] = None,
 ) -> None:
     """
-    GLBot と互換の形で歌詞を保存する。
-      - repo_name: 通常 YouTube 動画 ID
-      - README.md に歌詞とステータスを書き込む
-      - 既に README.md がある場合は「手動編集優先」として触らない
-      - source_code に 1/2/3 などを渡すと、その数字のファイルも作成
+    GLBot 互換フォーマットで lyrics repo を作成/保存する。
+
+    - repo_name … 通常 YouTube の video ID
+    - README.md に 歌詞/ステータス を書き込み
+    - 既に README.md がある場合は「手動編集優先」として何もしない
+    - source_code … 1=LrcLib, 2=YouTube 字幕, 3=PetitLyrics など
     """
     body = _serialize_lyrics(plain, cues)
 
@@ -126,34 +128,36 @@ def github_save_lyrics(
     content = f"{heading}\n\n```{lang}\n{body}\n```" if body else heading
 
     try:
+        # リポジトリ取得 or 作成
         try:
-            repo = _gh_user.get_repo(repo_name)
-            # 既に README があるなら何もしない（手動編集/既存優先）
+            repo = _GH_USER.get_repo(repo_name)
+            # 既に README があるなら何もしない
             try:
                 if any(f.name.lower() == "readme.md" for f in repo.get_contents("")):
                     return
             except GithubException:
                 pass
         except GithubException:
-            repo = _gh_user.create_repo(
+            repo = _GH_USER.create_repo(
                 repo_name, description=desc, private=False, auto_init=False
             )
 
-        # Description 更新（必要なら）
+        # Description 更新
         try:
             if (repo.description or "") != desc:
                 repo.edit(description=desc)
         except GithubException:
             pass
 
-        # README 作成
+        # README 作成（※存在チェック済みなので create_file 一択）
         repo.create_file("README.md", "Add lyrics", content, branch="main")
 
-        # 取得コードファイル
+        # 取得コード用の数値ファイル
         if source_code is not None:
             code_name = str(source_code)
             content_code = code_name + "\n"
 
+            # 他のコードファイルを削除
             for n in ("1", "2", "3"):
                 if n == code_name:
                     continue
@@ -181,12 +185,12 @@ def github_save_lyrics(
                 )
 
     except Exception:
-        # 失敗しても例外を外には投げない
+        # 失敗しても上には例外を投げない（Actions 側で処理を止めたくない）
         return
 
 
 # ─────────────────────────────────────────
-# LRC / bracket LRC パーサー（LrcLib 用）
+# LRC / bracket LRC パーサ（LrcLib 用）
 # ─────────────────────────────────────────
 
 LRC_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?]")
@@ -253,7 +257,7 @@ def lrclib_search(
     q: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    LrcLib /api/search を叩いて最も良さそうな1件を返す。
+    LrcLib /api/search を叩いて最も良さそうな 1 件を返す。
     """
     params: Dict[str, str] = {}
     if track_name:
@@ -277,6 +281,7 @@ def lrclib_search(
         return None
 
     if track_name or artist_name:
+
         def _score(rec: dict) -> int:
             s = 0
             if track_name and rec.get("trackName"):
@@ -426,9 +431,7 @@ def pl_search_fuzzy(title: str, *, score_cutoff: int = 85) -> Optional[int]:
 def pl_fetch(lyid: int) -> Optional[str]:
     try:
         sess = requests.Session()
-        page = sess.get(
-            f"{PL_BASE}/lyrics/{lyid}", headers=HEADERS, timeout=10
-        )
+        page = sess.get(f"{PL_BASE}/lyrics/{lyid}", headers=HEADERS, timeout=10)
         page.raise_for_status()
         js = sess.get(f"{PL_BASE}/lib/pl-lib.js", headers=HEADERS, timeout=10)
         js.raise_for_status()
@@ -631,6 +634,9 @@ BAD_ARTISTS = {
 
 
 def _canon_music_meta(info: dict) -> tuple[Optional[str], dict]:
+    """
+    yt_dlp の info dict から (表示用タイトル, 正規化メタ) を返す。
+    """
     artist = info.get("artist")
     if isinstance(artist, list):
         artist = ", ".join(a for a in artist if a)
@@ -664,6 +670,10 @@ def _canon_music_meta(info: dict) -> tuple[Optional[str], dict]:
 
 
 def _display_title_for(info: dict) -> str:
+    """
+    表示に使うタイトル。
+    公式メタがあればそちらを優先し、それがなければ YouTube タイトル。
+    """
     display, meta = _canon_music_meta(info or {})
     if meta:
         info["_music_meta"] = meta
